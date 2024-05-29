@@ -82,10 +82,10 @@ class ValueFinder:
         ]
 
         if df is not None:
-            self.df = pega_io.readDSExport(df, verbose=verbose)
+            self.df = pega_io.read_ds_export(df, verbose=verbose)
         else:
             filename = kwargs.pop("filename", "ValueFinder")
-            self.df = pega_io.readDSExport(filename, path, verbose=verbose)
+            self.df = pega_io.read_ds_export(filename, path, verbose=verbose)
         if kwargs.get("subset", True):
             self.df = self.df.select(
                 [col for col in keep_cols if col in self.df.columns]
@@ -146,7 +146,7 @@ class ValueFinder:
         """
         from datetime import datetime
 
-        time = cdh_utils.toPRPCDateTime(datetime.now())
+        time = cdh_utils.to_prpc_datetime(datetime.now())
         out = pega_io.cache_to_file(self.df, path, name=f"cached_ValueFinder_{time}")
         return out
 

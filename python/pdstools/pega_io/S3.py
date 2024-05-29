@@ -1,6 +1,8 @@
 import asyncio
+
 import aioboto3
 from tqdm.asyncio import tqdm
+
 from . import File
 
 
@@ -59,9 +61,9 @@ class S3Data:
 
         If `use_meta_files` is False, the logic is as simple as:
 
-        1. Import all files starting with the prefix 
-        (`'path/to/files'` gives 
-        `['path/to/files_001.json', 'path/to/files_002.json', etc]`, 
+        1. Import all files starting with the prefix
+        (`'path/to/files'` gives
+        `['path/to/files_001.json', 'path/to/files_002.json', etc]`,
         irrespective of whether a `.meta` file exists).
 
         Parameters
@@ -231,6 +233,6 @@ class S3Data:
             "predictorSnapshot", datamart_folder, verbose
         )
         return ADMDatamart(
-            model_df=File.readMultiZip(modelData, verbose=verbose),
-            predictor_df=File.readMultiZip(predictorData, verbose=verbose),
+            model_df=File.read_multi_zip(modelData, verbose=verbose),
+            predictor_df=File.read_multi_zip(predictorData, verbose=verbose),
         )

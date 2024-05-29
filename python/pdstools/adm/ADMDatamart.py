@@ -6,25 +6,24 @@ import logging
 import os
 import shutil
 import subprocess
-from collections import namedtuple
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Literal, NoReturn, Optional, Tuple, Union
+from typing import Dict, List, Literal, NoReturn, Optional, Tuple, Union
 
 import polars as pl
 import yaml
 
 from .. import pega_io
-from ..plots.plot_base import Plots
-from ..plots.plots_plotly import ADMVisualisations as plotly_plot
-from ..utils import cdh_utils, NBAD
+from ..utils import NBAD, cdh_utils
 from ..utils.errors import NotEagerError
 from ..utils.types import any_frame
+from . import utils
 from .ADMTrees import ADMTrees
-from .Tables import Tables
+
+PathLike = Union[str, bytes, os.PathLike]
 
 
-class ADMDatamart(Plots, Tables):
+class ADMDatamart:
     """Main class for importing, preprocessing and structuring Pega ADM Datamart.
     Gets all available data, properly names and merges into one main dataframe.
 
@@ -76,12 +75,12 @@ class ADMDatamart(Plots, Tables):
 
     Attributes
     ----------
-    modelData : pl.LazyFrame
+    model_data : pl.LazyFrame
         If available, holds the preprocessed data about the models
-    predictorData : pl.LazyFrame
+    predictor_data : pl.LazyFrame
         If available, holds the preprocessed data about the predictor binning
-    combinedData : pl.LazyFrame
-        If both modelData and predictorData are available,
+    combined_data : pl.LazyFrame
+        If both model_data and predictor_data are available,
         holds the merged data about the models and predictors
     import_strategy
         See the `import_strategy` parameter
@@ -105,7 +104,7 @@ class ADMDatamart(Plots, Tables):
 
     """
 
-    standardChannelGroups = [
+    standard_channel_groups = [
         "Web",
         "Mobile",
         "E-mail",
@@ -115,46 +114,48 @@ class ADMDatamart(Plots, Tables):
         "Call Center",
         "IVR",
     ]
-    standardDirections = ["Inbound", "Outbound"]
+    standard_directions = ["Inbound", "Outbound"]
 
-    NBAD_model_configurations = [
+    nbad_model_configurations = [
         x.model_name.upper() for x in NBAD.standardNBADModelConfigurations
     ]
 
     def __init__(
         self,
-        path: Union[str, Path] = Path("."),
+        path: Union[str, Path] = ".",
         import_strategy: Literal["eager", "lazy"] = "eager",
         *,
-        model_filename: Optional[str] = "modelData",
-        predictor_filename: Optional[str] = "predictorData",
+        model_filename: Optional[str] = "model_data",
+        predictor_filename: Optional[str] = "predictor_data",
         model_df: Optional[any_frame] = None,
         predictor_df: Optional[any_frame] = None,
         query: Optional[Union[pl.Expr, List[pl.Expr], str, Dict[str, list]]] = None,
         subset: bool = True,
         drop_cols: Optional[list] = None,
         include_cols: Optional[list] = None,
-        context_keys: list = [
-            "Channel",
-            "Direction",
-            "Issue",
-            "Group",
-        ],  # TODO Name/Treatment are normally also part of context
-        extract_keys: bool = False,  # TODO: should be True by default, extract should be efficiently using Configuration
-        predictorCategorization: pl.Expr = cdh_utils.defaultPredictorCategorization,
-        plotting_engine: Union[
-            str, Any
-        ] = "plotly",  # TODO drop this, no plot engine abstraction
+        context_keys: Optional[list] = None,
+        extract_keys: bool = False,
+        predictor_categorization: Optional[pl.Expr] = None,
         verbose: bool = False,
         **reading_opts,
     ):
         self.import_strategy = import_strategy
-        self.context_keys = context_keys
+        self.context_keys = context_keys or [
+            "Channel",
+            "Direction",
+            "Issue",
+            "Group",
+        ]  # TODO: name and treatment are also normally part of context
         self.verbose = verbose
         self.query = query
-        self.predictorCategorization = predictorCategorization
-
-        self.modelData, self.predictorData = self.import_data(
+        self.predictor_categorization = (
+            predictor_categorization or cdh_utils.default_predictor_categorization()
+        )
+        (
+            self.model_data,
+            self.predictor_data,
+            self.combined_data,
+        ) = utils.import_datamart(
             path,
             model_filename=model_filename,
             predictor_filename=predictor_filename,
@@ -163,50 +164,17 @@ class ADMDatamart(Plots, Tables):
             subset=subset,
             drop_cols=drop_cols,
             include_cols=include_cols,
+            context_keys=context_keys,
             extract_keys=extract_keys,
             **reading_opts,
         )
-        if self.modelData is not None:
-            missing_context_keys = [
-                key for key in self.context_keys if key not in self.modelData.columns
-            ]
-            if missing_context_keys:
-                self.modelData = self.modelData.with_columns(
-                    *[pl.lit("NA").alias(key) for key in missing_context_keys]
-                )
-
-        self.plotting_engine = plotting_engine
-        super().__init__()
-
-        self.processTables(self.query)
-
-    # TODO: Lets drop the configurable plotting engines, but isolate the plotly code
-
-    @staticmethod
-    def get_engine(plotting_engine):
-        """Which engine to use for creating the plots.
-
-        By supplying a custom class here, you can re-use the pdstools functions
-        but create visualisations to your own specifications, in any library.
-        """
-        if not isinstance(plotting_engine, str):
-            return plotting_engine
-        elif plotting_engine == "plotly":
-            return plotly_plot
-        else:
-            msg = (
-                f"Plotting engine {plotting_engine} not known. "
-                "Please supply your own class with function names corresponding to plot_base.py "
-                "or pass 'Plotly' to use the default engine."
-            )
-            raise ValueError(msg)
 
     def import_data(
         self,
         path: Optional[Union[str, Path]] = Path("."),
         *,
-        model_filename: Optional[str] = "modelData",
-        predictor_filename: Optional[str] = "predictorData",
+        model_filename: Optional[str] = "model_data",
+        predictor_filename: Optional[str] = "predictor_data",
         model_df: Optional[any_frame] = None,
         predictor_df: Optional[any_frame] = None,
         subset: bool = True,
@@ -317,12 +285,12 @@ class ADMDatamart(Plots, Tables):
             )
 
             if (
-                self.predictorCategorization is not None
+                self.predictor_categorization is not None
                 and "PredictorCategory" not in df2.columns
             ):
-                if not isinstance(self.predictorCategorization, pl.Expr):
-                    self.predictorCategorization = self.predictorCategorization()
-                df2 = df2.with_columns(PredictorCategory=self.predictorCategorization)
+                if not isinstance(self.predictor_categorization, pl.Expr):
+                    self.predictor_categorization = self.predictor_categorization()
+                df2 = df2.with_columns(PredictorCategory=self.predictor_categorization)
 
         if df1 is not None and df2 is not None:
             total_missing = (
@@ -341,11 +309,11 @@ class ADMDatamart(Plots, Tables):
 
     @property
     def is_available(self) -> bool:
-        return len(self.modelData.head(1).collect()) > 0
+        return self.model_data and len(self.model_data.head(1).collect()) > 0
 
     def _import_utils(
         self,
-        name: Union[str, any_frame],
+        name: Union[Literal["model_data", "predictor_data"], any_frame],
         path: Optional[str] = None,
         *,
         subset: bool = True,
@@ -359,7 +327,7 @@ class ADMDatamart(Plots, Tables):
         Parameters
         ----------
         name : Union[str, pl.DataFrame]
-            One of {modelData, predictorData}
+            One of {model_data, predictor_data}
             or a dataframe
         path: str, default = None
             The path of the data file
@@ -394,7 +362,7 @@ class ADMDatamart(Plots, Tables):
             self.import_strategy = "eager"
 
         if isinstance(name, str) or isinstance(name, BytesIO):
-            df = pega_io.readDSExport(
+            df = pega_io.read_ds_export(
                 filename=name, path=path, verbose=self.verbose, **reading_opts
             )
         elif isinstance(name, pl.DataFrame):
@@ -409,7 +377,7 @@ class ADMDatamart(Plots, Tables):
         if df is None:
             return None, None, None
 
-        df = cdh_utils._polarsCapitalize(df)
+        df = cdh_utils._polars_capitalize(df)
         cols, missing = self._available_columns(
             df, include_cols=include_cols, drop_cols=drop_cols
         )
@@ -417,7 +385,7 @@ class ADMDatamart(Plots, Tables):
             df = df.select(cols)
         if extract_keys:
             df = cdh_utils._extract_keys(df, import_strategy=self.import_strategy)
-            df = cdh_utils._polarsCapitalize(df)
+            df = cdh_utils._polars_capitalize(df)
 
         df = self._set_types(
             df,
@@ -553,15 +521,17 @@ class ADMDatamart(Plots, Tables):
         return df
 
     def last(
-        self, table="modelData", strategy: Literal["eager", "lazy"] = "eager"
+        self,
+        table: Literal["model_data", "predictor_data", "combined_data"] = "model_data",
+        strategy: Literal["eager", "lazy"] = "eager",
     ) -> any_frame:
         """Convenience function to get the last values for a table
 
         Parameters
         ----------
-        table : str, default = modelData
+        table : str, default = model_data
             Which table to get the last values for
-            One of {modelData, predictorData, combinedData}
+            One of {model_data, predictor_data, combined_data}
         strategy: Literal['eager', 'lazy'], default = 'eager'
             Whether to import the file fully to memory, or scan the file
             When data fits into memory, 'eager' is typically more efficient
@@ -578,7 +548,7 @@ class ADMDatamart(Plots, Tables):
             df = self._last(table)
 
         elif isinstance(table, str):
-            assert table in {"modelData", "predictorData", "combinedData"}
+            assert table in {"model_data", "predictor_data", "combined_data"}
             df = self._last(getattr(self, table))
         else:  # pragma: no cover
             raise ValueError("This should not happen, please file a GitHub issue :).")
@@ -591,24 +561,6 @@ class ADMDatamart(Plots, Tables):
         return df.filter(
             pl.col("SnapshotTime").fill_null(fill_date)
             == pl.col("SnapshotTime").fill_null(fill_date).max()
-        )
-
-    @staticmethod
-    def _last_timestamp(col: Literal["ResponseCount", "Positives"]) -> pl.Expr:
-        """Add a column to indicate the last timestamp a column has changed.
-
-        Parameters
-        ----------
-        col : Literal['ResponseCount', 'Positives']
-            The column to calculate the diff for
-        """
-
-        return (
-            pl.when(pl.col(col).min() == pl.col(col).max())
-            .then(pl.max("SnapshotTime"))
-            .otherwise(pl.col("SnapshotTime").filter(pl.col(col).diff() != 0).max())
-            .over("ModelID")
-            .alias(f"Last_{col}")
         )
 
     def _get_combined_data(
@@ -631,24 +583,24 @@ class ADMDatamart(Plots, Tables):
         Union[pl.DataFrame, pl.LazyFrame]
             The combined dataframe
         """
-        models = self.last(self.modelData, "lazy") if last else self.modelData
-        preds = self.last(self.predictorData, "lazy") if last else self.predictorData
+        models = self.last(self.model_data, "lazy") if last else self.model_data
+        preds = self.last(self.predictor_data, "lazy") if last else self.predictor_data
         combined = models.join(preds, on="ModelID", how="inner", suffix="Bin")
         if strategy == "eager":
             return combined.collect().lazy()
         else:
             return combined
 
-    def processTables(
+    def process_tables(
         self,
         query: Optional[Union[pl.Expr, List[pl.Expr], str, Dict[str, list]]] = None,
     ) -> ADMDatamart:
-        """Processes modelData, predictorData and combinedData tables.
+        """Processes model_data, predictor_data and combined_data tables.
 
-        Can take in a query, which it will apply to modelData
-        If a query is given, it joins predictorData to only retain the modelIDs
-        the modelData was filtered on. If both modelData and predictorData
-        are present, it joins them together into combinedData.
+        Can take in a query, which it will apply to model_data
+        If a query is given, it joins predictor_data to only retain the modelIDs
+        the model_data was filtered on. If both model_data and predictor_data
+        are present, it joins them together into combined_data.
 
         If memory_strategy is eager, which is the default, this method also
         collects the tables and then sets them back to lazy.
@@ -656,26 +608,26 @@ class ADMDatamart(Plots, Tables):
         Parameters
         ----------
         query: Optional[Union[pl.Expr, List[pl.Expr], str, Dict[str, list]]], default = None
-            An optional query to apply to the modelData table.
+            An optional query to apply to the model_data table.
             See: :meth:`._apply_query`
 
         """
-        if self.modelData is not None:
+        if self.model_data is not None:
             if query is not None:
-                self.modelData = self._apply_query(self.modelData, query)
+                self.model_data = self._apply_query(self.model_data, query)
             if self.import_strategy == "eager":
-                self.modelData = self.modelData.collect().lazy()
+                self.model_data = self.model_data.collect().lazy()
 
-        if self.predictorData is not None:
+        if self.predictor_data is not None:
             if query is not None:
-                self.predictorData = self.predictorData.join(
-                    self.modelData.select(pl.col("ModelID").unique()), on="ModelID"
+                self.predictor_data = self.predictor_data.join(
+                    self.model_data.select(pl.col("ModelID").unique()), on="ModelID"
                 )
             if self.import_strategy == "eager":
-                self.predictorData = self.predictorData.collect().lazy()
+                self.predictor_data = self.predictor_data.collect().lazy()
 
-        if self.predictorData is not None and self.modelData is not None:
-            self.combinedData = self._get_combined_data(strategy=self.import_strategy)
+        if self.predictor_data is not None and self.model_data is not None:
+            self.combined_data = self._get_combined_data(strategy=self.import_strategy)
         elif self.verbose:
             print(
                 "Could not be combined. Do you have both model data and predictor data?"
@@ -683,8 +635,10 @@ class ADMDatamart(Plots, Tables):
 
         return self
 
-    def save_data(self, path: str = ".") -> Tuple[os.PathLike, os.PathLike]:
-        """Cache modelData and predictorData to files.
+    def save_data(
+        self, path: PathLike = "."
+    ) -> Tuple[Union[Path, None], Union[Path, None]]:
+        """Cache model_data and predictor_data to files.
 
         Parameters
         ----------
@@ -693,23 +647,25 @@ class ADMDatamart(Plots, Tables):
 
         Returns
         -------
-        (os.PathLike, os.PathLike):
+        (Path, Path):
             The paths to the model and predictor data files
         """
         from datetime import datetime
 
         time = datetime.now().strftime("%Y%m%dT%H%M%S.%f")[:-3]
-        if self.modelData is not None:
-            modeldata_cache = pega_io.cache_to_file(
-                self.modelData, path, name=f"cached_modelData_{time}"
-            )
-        if self.predictorData is not None:
-            predictordata_cache = pega_io.cache_to_file(
-                self.predictorData, path, name=f"cached_predictorData_{time}"
+        if self.model_data is not None:
+            model_data_cache = pega_io.cache_to_file(
+                self.model_data, path, name=f"cached_model_data_{time}"
             )
         else:
-            predictordata_cache = None
-        return modeldata_cache, predictordata_cache
+            model_data_cache = None
+        if self.predictor_data is not None:
+            predictor_data_cache = pega_io.cache_to_file(
+                self.predictor_data, path, name=f"cached_predictor_data_{time}"
+            )
+        else:
+            predictor_data_cache = None
+        return model_data_cache, predictor_data_cache
 
     def _apply_query(
         self,
@@ -776,15 +732,15 @@ class ADMDatamart(Plots, Tables):
             if not isinstance(query, dict):
                 raise TypeError("query must be a dict where values are lists")
             for val in query.values():
-                if not type(val) == list:
+                if type(val) != list:
                     raise ValueError("query values must be list")
 
             for col, val in query.items():
                 df = df.filter(pl.col(col).is_in(val))
         return df
 
-    def discover_modelTypes(
-        self, df: pl.LazyFrame, by: str = "Configuration", allow_collect=False
+    def discover_model_types(
+        self, df: pl.LazyFrame, by: str = "Configuration", allow_collect: bool = False
     ) -> Dict:  # pragma: no cover
         """Discovers the type of model embedded in the pyModelData column.
 
@@ -800,9 +756,9 @@ class ADMDatamart(Plots, Tables):
             The column to look for types in. Configuration is recommended.
         allow_collect: bool, default = False
             Set to True to allow discovering modelTypes, even if in lazy strategy.
-            It will fetch one modelData string per configuration.
+            It will fetch one model_data string per configuration.
         """
-        if self.import_strategy != "eager" and allow_collect == False:
+        if self.import_strategy != "eager" and not allow_collect:
             raise NotEagerError("Discovering AGB models")
         if "Modeldata" not in df.columns:
             raise ValueError(
@@ -813,7 +769,7 @@ class ADMDatamart(Plots, Tables):
                 )
             )
 
-        def _getType(val):
+        def _get_type(val):
             import base64
             import zlib
 
@@ -831,12 +787,12 @@ class ADMDatamart(Plots, Tables):
             .group_by(by)
             .agg(pl.col("Modeldata").last())
             .collect()
-            .with_columns(pl.col("Modeldata").map_elements(lambda v: _getType(v)))
+            .with_columns(pl.col("Modeldata").map_elements(lambda v: _get_type(v)))
             .to_dicts()
         )
         return {key: value for key, value in [i.values() for i in types]}
 
-    def get_AGB_models(
+    def get_agb_models(
         self,
         last: bool = False,
         by: str = "Configuration",
@@ -844,7 +800,7 @@ class ADMDatamart(Plots, Tables):
         query: Optional[Union[pl.Expr, List[pl.Expr], str, Dict[str, list]]] = None,
         verbose: bool = True,
         **kwargs,
-    ) -> Dict:  # pragma: no cover
+    ) -> ADMTrees:  # pragma: no cover
         """Method to automatically extract AGB models.
 
         Recommended to subset using the querying functionality
@@ -868,16 +824,18 @@ class ADMDatamart(Plots, Tables):
             Whether to print out information while importing
 
         """
-        df = self.modelData
+        df = self.model_data
+        if not df:
+            raise ValueError("Needs model_data to get agb models")
         if query is not None:
             df = self._apply_query(df, query)
 
-        modelTypes = self.discover_modelTypes(df)
-        AGB_models = [
-            model for model, type in modelTypes.items() if type.endswith("GbModel")
+        model_types = self.discover_model_types(df)
+        agb_models = [
+            model for model, type in model_types.items() if type.endswith("GbModel")
         ]
-        logging.info(f"Found AGB models: {AGB_models}")
-        df = df.filter(pl.col("Configuration").is_in(AGB_models))
+        logging.info(f"Found AGB models: {agb_models}")
+        df = df.filter(pl.col("Configuration").is_in(agb_models))
         if df.select(pl.col("ModelID").n_unique()).collect().item() == 0:
             raise ValueError("No models found.")
 
@@ -913,7 +871,7 @@ class ADMDatamart(Plots, Tables):
         Parameters
         ----------
         df: pd.DataFrame
-            This is typically pivoted ModelData
+            This is typically pivoted model_data
         by: str, default = Name
             Column to calculate the daily change for.
 
@@ -986,7 +944,9 @@ class ADMDatamart(Plots, Tables):
         pl.LazyFrame:
             group_by dataframe over all models
         """
-        df = self._apply_query(self.modelData, query)
+        if not self.model_data:
+            raise ValueError("Needs model_data to get model summary.")
+        df = self._apply_query(self.model_data, query)
         data = self.last(df, strategy="lazy").lazy()
 
         aggcols = ["ResponseCount", "Performance", "SuccessRate", "Positives"]
@@ -1026,7 +986,7 @@ class ADMDatamart(Plots, Tables):
     def pivot_df(
         self,
         df: pl.LazyFrame,
-        by: Union[str, list] = "Name",
+        by: Union[str, list[str]] = "Name",
         *,
         allow_collect: bool = True,
         top_n: int = 0,
@@ -1058,8 +1018,12 @@ class ADMDatamart(Plots, Tables):
         if self.import_strategy == "lazy" and not allow_collect:
             raise NotEagerError("Pivot df.")
 
-        df = df.filter(pl.col("PredictorName") != "Classifier").with_columns(
-            pl.col("PerformanceBin").fill_nan(0.5),
+        df = (
+            df.lazy()
+            .filter(pl.col("PredictorName") != "Classifier")
+            .with_columns(
+                pl.col("PerformanceBin").fill_nan(0.5),
+            )
         )
         if by not in ["ModelID", "Name"]:
             df = (
@@ -1071,7 +1035,7 @@ class ADMDatamart(Plots, Tables):
                     )
                 )
             )
-        df = (
+        pivotted_df = (
             df.collect()
             .pivot(
                 index=by,
@@ -1083,7 +1047,7 @@ class ADMDatamart(Plots, Tables):
             .fill_nan(0.5)
         )
         mod_order = (
-            df.select(
+            pivotted_df.select(
                 pl.concat_list(pl.col(pl.Float64))
                 .list.eval(pl.element().mean())
                 .list.get(0)
@@ -1092,15 +1056,15 @@ class ADMDatamart(Plots, Tables):
             .to_series()
         )[:top_n]
         pred_order = [by] + [
-            df.columns[i + 1]
+            pivotted_df.columns[i + 1]
             for i in 0
-            + df.select(pl.col(pl.Float64).mean())
+            + pivotted_df.select(pl.col(pl.Float64).mean())
             .transpose()
             .select(pl.all().arg_sort(descending=True))
             .to_series()
         ][:top_n]
 
-        return df[mod_order].select(pred_order)
+        return pivotted_df[mod_order].select(pred_order)
 
     @staticmethod
     def response_gain_df(df: any_frame, by: str = "Channel") -> any_frame:
@@ -1192,10 +1156,10 @@ class ADMDatamart(Plots, Tables):
             'models_missing_{key}': The number of models with missing values for each context key.
             'models_bottom_left': The models with a performance of 50 and a success rate of 0.
         """
-        if self.modelData is None:
+        if self.model_data is None:
             raise ValueError("No model data to analyze.")
 
-        data = self.last(self.modelData) if last else self.modelData
+        data = self.last(self.model_data) if last else self.model_data
 
         ret = dict()
         ret["models_n_snapshots"] = data.select(pl.n_unique("SnapshotTime")).item()
@@ -1252,8 +1216,8 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
 
         It's possible to give this query to the initial `ADMDatamart` class
         directly, but this method is more explicit. Filters on the model data
-        (query is put in a :meth:`polars.filter()` method), filters the predictorData
-        on the ModelIDs remaining after the query, and recomputes combinedData.
+        (query is put in a :meth:`polars.filter()` method), filters the predictor_data
+        on the ModelIDs remaining after the query, and recomputes combined_data.
 
         Only works with Polars expressions.
 
@@ -1272,7 +1236,7 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
         - When context keys have empty string values, replaces them
         with "NA" string
         """
-        self.modelData = self.modelData.with_columns(
+        self.model_data = self.model_data.with_columns(
             pl.col(pl.Categorical).fill_null("NA"),
             pl.col(pl.Utf8).fill_null("NA"),
             pl.col(pl.Null).fill_null("NA"),
@@ -1303,8 +1267,8 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
         directionMapping = pl.DataFrame(
             # Standard directions have a 1:1 mapping to channel groups
             {
-                "Direction": self.standardDirections,
-                "DirectionGroup": self.standardDirections,
+                "Direction": self.standard_directions,
+                "DirectionGroup": self.standard_directions,
             }
         ).with_columns(normalizedDirection=name_normalizer("Direction"))
 
@@ -1314,8 +1278,8 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
                     pl.DataFrame(
                         # Standard channels have a 1:1 mapping to channel groups
                         {
-                            "Channel": self.standardChannelGroups,
-                            "ChannelGroup": self.standardChannelGroups,
+                            "Channel": self.standard_channel_groups,
+                            "ChannelGroup": self.standard_channel_groups,
                         }
                     ),
                     pl.DataFrame(
@@ -1346,7 +1310,7 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
         # values when there are no treatments
         treatmentIdentifierExpr = (
             pl.concat_str(["Issue", "Group", "Name", "Treatment"], separator="/")
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit("")
         )
         activeTreatmentExpr = (
@@ -1354,32 +1318,32 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
                 (pl.col("ResponseCount").sum() > 0)
                 & (pl.col("Treatment").is_not_null())
             ).over(["Issue", "Group", "Name", "Treatment"])
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit(False)
         )
         uniqueTreatmentExpr = (
             treatmentIdentifierExpr.unique()
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit([])
         )
         uniqueTreatmentCountExpr = (
             treatmentIdentifierExpr.n_unique()
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit(0)
         )
         uniqueUsedTreatmentExpr = (
             treatmentIdentifierExpr.filter(pl.col("isUsedTreatment")).unique()
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit([])
         )
         uniqueUsedTreatmentCountExpr = (
             treatmentIdentifierExpr.filter(pl.col("isUsedTreatment")).n_unique()
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit(0)
         )
 
         return (
-            self.modelData.with_columns(
+            self.model_data.with_columns(
                 activeActionExpr.alias("isUsedAction"),
                 activeTreatmentExpr.alias("isUsedTreatment"),
             )
@@ -1435,7 +1399,7 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
                 pl.col("Configuration")
                 .cast(pl.Utf8)
                 .str.to_uppercase()
-                .is_in(self.NBAD_model_configurations)
+                .is_in(self.nbad_model_configurations)
                 .alias("isNBADModelConfiguration"),
                 actionIdentifierExpr.n_unique().alias("Total Number of Actions"),
                 uniqueTreatmentCountExpr.alias("Total Number of Treatments"),
@@ -1511,23 +1475,23 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
     def overall_summary(self, custom_channels: Dict[str, str] = None):
         totalTreatments = (
             pl.col("AllTreatments").list.explode().n_unique()
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit(0)
         )
         totalUsedTreatments = (
             pl.col("AllUsedTreatments").list.explode().n_unique()
-            if "Treatment" in self.modelData.columns
+            if "Treatment" in self.model_data.columns
             else pl.lit(0)
         )
 
         # Re-calculating here because the use of NBAD in the channel
         # summary does not currently take into account the omni adaptive model
         usesNBAD = (
-            self.modelData.select(
+            self.model_data.select(
                 pl.col("Configuration")
                 .cast(pl.Utf8)
                 .str.to_uppercase()
-                .is_in(self.NBAD_model_configurations)
+                .is_in(self.nbad_model_configurations)
                 .any()
             )
             .collect()
@@ -1535,11 +1499,11 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
         )
 
         usesNBADOnly = (
-            self.modelData.select(
+            self.model_data.select(
                 pl.col("Configuration")
                 .cast(pl.Utf8)
                 .str.to_uppercase()
-                .is_in(self.NBAD_model_configurations)
+                .is_in(self.nbad_model_configurations)
                 .all()
             )
             .collect()
@@ -1679,17 +1643,19 @@ Meaning in total, {self.model_stats['models_n_nonperforming']} ({round(self.mode
             if not cached_data:
                 return self.save_data(working_dir)
             else:
-                modeldata_files = glob.glob(f"{working_dir}/cached_modelData*")
-                predictordata_files = glob.glob(f"{working_dir}/cached_predictorData*")
-                if modeldata_files:
-                    modeldata_cache = modeldata_files[0]
+                model_data_files = glob.glob(f"{working_dir}/cached_model_data*")
+                predictor_data_files = glob.glob(
+                    f"{working_dir}/cached_predictor_data*"
+                )
+                if model_data_files:
+                    model_data_cache = model_data_files[0]
                 else:
                     raise FileNotFoundError("No cached model data found.")
-                if predictordata_files:
-                    predictordata_cache = predictordata_files[0]
+                if predictor_data_files:
+                    predictor_data_cache = predictor_data_files[0]
                 else:
-                    predictordata_cache = None
-                return modeldata_cache, predictordata_cache
+                    predictor_data_cache = None
+                return model_data_cache, predictor_data_cache
 
         def get_params(modelid, predictordetails_activeonly):
             return {

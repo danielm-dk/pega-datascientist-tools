@@ -5,21 +5,21 @@ cdhtools: Data Science add-ons for Pega.
 Various utilities to access and manipulate data from Pega for purposes
 of data analysis, reporting and monitoring.
 """
-
-from typing import List, Union
-import polars as pl
-import re
-import numpy as np
 import datetime
-import warnings
-from .types import any_frame
-from .errors import NotEagerError
-from .table_definitions import PegaDefaultTables
+import re
+from typing import Iterable, List, Literal, Optional, TypeVar, Union, overload
 
+import numpy as np
+import plotly.graph_objects as go
+import polars as pl
 import pytz
 
+from .errors import NotEagerError
 
-def defaultPredictorCategorization(
+frame = TypeVar("frame", pl.DataFrame, pl.LazyFrame)
+
+
+def default_predictor_categorization(
     x: Union[str, pl.Expr] = pl.col("PredictorName"),
 ) -> pl.Expr:
     """Function to determine the 'category' of a predictor.
@@ -51,11 +51,11 @@ def defaultPredictorCategorization(
 
 
 def _extract_keys(
-    df: any_frame,
+    df: frame,
     col="Name",
     capitalize=True,
     import_strategy="eager",
-) -> any_frame:
+) -> pl.Expr:
     """Extracts keys out of the pyName column
 
     This is not a lazy operation as we don't know the possible keys
@@ -75,7 +75,7 @@ def _extract_keys(
     if import_strategy != "eager":
         raise NotEagerError("Extracting keys")
 
-    def safeName():
+    def safe_name():
         return (
             pl.when(~pl.col(col).cast(pl.Utf8).str.starts_with("{"))
             .then(pl.concat_str([pl.lit('{"pyName":"'), pl.col(col), pl.lit('"}')]))
@@ -84,7 +84,7 @@ def _extract_keys(
 
     series = (
         df.select(
-            safeName().str.json_decode(),
+            safe_name().str.json_decode(),
         )
         .unnest("tempName")
         .lazy()
@@ -92,14 +92,14 @@ def _extract_keys(
     )
     if not capitalize:
         return df.with_columns(series)
-    return df.with_columns(_polarsCapitalize(series))
+    return _polars_capitalize(series)
 
 
-def parsePegaDateTimeFormats(
-    timestampCol="SnapshotTime",
-    timestamp_fmt: str = None,
+def parse_pega_datetime_formats(
+    timestamp_col="SnapshotTime",
+    timestamp_fmt: Optional[str] = None,
     strict_conversion: bool = True,
-):
+) -> pl.Expr:
     """Parses Pega DateTime formats.
 
     Supports the two most commonly used formats:
@@ -121,120 +121,124 @@ def parsePegaDateTimeFormats(
         Whether to error on incorrect parses or just return Null values
     """
     if timestamp_fmt is not None:
-        return pl.col(timestampCol).str.strptime(
+        return pl.col(timestamp_col).str.strptime(
             pl.Datetime,
             timestamp_fmt,
             strict=strict_conversion,
         )
     else:
         return (
-            pl.when((pl.col(timestampCol).str.slice(4, 1) == pl.lit("-")))
+            pl.when((pl.col(timestamp_col).str.slice(4, 1) == pl.lit("-")))
             .then(
-                pl.col(timestampCol)
+                pl.col(timestamp_col)
                 .str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False)
                 .dt.cast_time_unit("ns")
             )
             .otherwise(
-                pl.col(timestampCol)
+                pl.col(timestamp_col)
                 .str.strptime(pl.Datetime, "%Y%m%dT%H%M%S.%3f %Z", strict=False)
                 .dt.replace_time_zone(None)
                 .dt.cast_time_unit("ns")
             )
-        ).alias(timestampCol)
+        ).alias(timestamp_col)
 
 
-def getTypeMapping(df, definition, verbose=False, **timestamp_opts):
-    """
-    This function is used to convert the data types of columns in a DataFrame to a desired types.
-    The desired types are defined in a `PegaDefaultTables` class.
+# TODO Commenting this out for now while doing refactoring
+# This code should be removed because we should have a better solution for it
+# We should just maintain proper table dictionaries where we have this info available
 
-    Parameters
-    ----------
-    df : pl.LazyFrame
-        The DataFrame whose columns' data types need to be converted.
-    definition : PegaDefaultTables
-        A `PegaDefaultTables` object that contains the desired data types for the columns.
-    verbose : bool
-        If True, the function will print a message when a column is not in the default table schema.
-    timestamp_opts : str
-        Additional arguments for timestamp parsing.
+# def get_type_mapping(df, definition, verbose:bool=False, **timestamp_opts):
+#     """
+#     This function is used to convert the data types of columns in a DataFrame to a desired types.
+#     The desired types are defined in a `PegaDefaultTables` class.
 
-    Returns
-    -------
-    List
-        A list with polars expressions for casting data types.
-    """
+#     Parameters
+#     ----------
+#     df : pl.LazyFrame
+#         The DataFrame whose columns' data types need to be converted.
+#     definition : PegaDefaultTables
+#         A `PegaDefaultTables` object that contains the desired data types for the columns.
+#     verbose : bool
+#         If True, the function will print a message when a column is not in the default table schema.
+#     timestamp_opts : str
+#         Additional arguments for timestamp parsing.
 
-    def getMapping(columns, reverse=False):
-        if not reverse:
-            return dict(zip(columns, _capitalize(columns)))
-        else:
-            return dict(zip(_capitalize(columns), columns))
+#     Returns
+#     -------
+#     List
+#         A list with polars expressions for casting data types.
+#     """
 
-    named = getMapping(df.columns)
-    typed = getMapping(
-        [col for col in dir(definition) if not col.startswith("__")], reverse=True
-    )
+#     def getMapping(columns, reverse=False):
+#         if not reverse:
+#             return dict(zip(columns, _capitalize(columns)))
+#         else:
+#             return dict(zip(_capitalize(columns), columns))
 
-    types = []
-    for col, renamedCol in named.items():
-        try:
-            new_type = getattr(definition, typed[renamedCol])
-            original_type = df.schema[col].base_type()
-            if original_type == pl.Null:
-                if verbose:
-                    warnings.warn(f"Warning: {col} column is Null data type.")
-            elif original_type != new_type:
-                if original_type == pl.Categorical and new_type in pl.NUMERIC_DTYPES:
-                    types.append(pl.col(col).cast(pl.Utf8).cast(new_type))
-                elif new_type == pl.Datetime and original_type != pl.Date:
-                    types.append(parsePegaDateTimeFormats(col, **timestamp_opts))
-                else:
-                    types.append(pl.col(col).cast(new_type))
-        except:
-            if verbose:
-                warnings.warn(
-                    f"Column {col} not in default table schema, can't set type."
-                )
-    return types
+#     named = getMapping(df.columns)
+#     typed = getMapping(
+#         [col for col in dir(definition) if not col.startswith("__")], reverse=True
+#     )
 
-
-def set_types(df, table="infer", verbose=False, **timestamp_opts):
-    if table == "infer":
-        table = inferTableDefinition(df)
-
-    if table == "pyValueFinder":
-        definition = PegaDefaultTables.pyValueFinder()
-    elif table == "ADMModelSnapshot":
-        definition = PegaDefaultTables.ADMModelSnapshot()
-    elif table == "ADMPredictorBinningSnapshot":
-        definition = PegaDefaultTables.ADMPredictorBinningSnapshot()
-
-    else:
-        raise ValueError(table)
-
-    mapping = getTypeMapping(df, definition, verbose=verbose, **timestamp_opts)
-
-    if len(mapping) > 0:
-        return df.with_columns(mapping)
-    else:
-        return df
+#     types = []
+#     for col, renamedCol in named.items():
+#         try:
+#             new_type = getattr(definition, typed[renamedCol])
+#             original_type = df.schema[col].base_type()
+#             if original_type == pl.Null:
+#                 if verbose:
+#                     warnings.warn(f"Warning: {col} column is Null data type.")
+#             elif original_type != new_type:
+#                 if original_type == pl.Categorical and new_type in pl.NUMERIC_DTYPES:
+#                     types.append(pl.col(col).cast(pl.Utf8).cast(new_type))
+#                 elif new_type == pl.Datetime and original_type != pl.Date:
+#                     types.append(parse_pega_datetime_formats(col, **timestamp_opts))
+#                 else:
+#                     types.append(pl.col(col).cast(new_type))
+#         except:
+#             if verbose:
+#                 warnings.warn(
+#                     f"Column {col} not in default table schema, can't set type."
+#                 )
+#     return types
 
 
-def inferTableDefinition(df):
-    cols = _capitalize(df.columns)
-    vf = ["Propensity", "Stage"]
-    predictors = ["PredictorName", "ModelID", "BinSymbol"]
-    models = ["ModelID", "Performance"]
-    if all(value in cols for value in vf):
-        return "pyValueFinder"
-    elif all(value in cols for value in predictors):
-        return "ADMPredictorBinningSnapshot"
-    elif all(value in cols for value in models):
-        return "ADMModelSnapshot"
-    else:
-        print("Could not find table definition.")
-        return cols
+# def set_types(df, table="infer", verbose=False, **timestamp_opts):
+#     if table == "infer":
+#         table = inferTableDefinition(df)
+
+#     if table == "pyValueFinder":
+#         definition = PegaDefaultTables.pyValueFinder()
+#     elif table == "ADMModelSnapshot":
+#         definition = PegaDefaultTables.ADMModelSnapshot()
+#     elif table == "ADMPredictorBinningSnapshot":
+#         definition = PegaDefaultTables.ADMPredictorBinningSnapshot()
+
+#     else:
+#         raise ValueError(table)
+
+#     mapping = get_type_mapping(df, definition, verbose=verbose, **timestamp_opts)
+
+#     if len(mapping) > 0:
+#         return df.with_columns(mapping)
+#     else:
+#         return df
+
+
+# def inferTableDefinition(df):
+#     cols = _capitalize(df.columns)
+#     vf = ["Propensity", "Stage"]
+#     predictors = ["PredictorName", "ModelID", "BinSymbol"]
+#     models = ["ModelID", "Performance"]
+#     if all(value in cols for value in vf):
+#         return "pyValueFinder"
+#     elif all(value in cols for value in predictors):
+#         return "ADMPredictorBinningSnapshot"
+#     elif all(value in cols for value in models):
+#         return "ADMModelSnapshot"
+#     else:
+#         print("Could not find table definition.")
+#         return cols
 
 
 def safe_range_auc(auc: float) -> float:
@@ -259,7 +263,7 @@ def safe_range_auc(auc: float) -> float:
 
 def auc_from_probs(
     groundtruth: List[int], probs: List[float]
-) -> List[float]:  # pragma: no cover
+) -> float:  # pragma: no cover
     """Calculates AUC from an array of truth values and predictions.
     Calculates the area under the ROC curve from an array of truth values and
     predictions, making sure to always return a value between 0.5 and 1.0 and
@@ -273,7 +277,7 @@ def auc_from_probs(
     probs : List[float]
         The predictions, as a numeric vector of the same length as groundtruth
 
-    Returns : List[float]
+    Returns : float
         The AUC as a value between 0.5 and 1.
 
     Examples:
@@ -299,7 +303,7 @@ def auc_from_probs(
 
 
 def auc_from_bincounts(
-    pos: List[int], neg: List[int], probs: List[float] = None
+    pos: Iterable[int], neg: Iterable[int], probs: Optional[Iterable[float]] = None
 ) -> float:
     """Calculates AUC from counts of positives and negatives directly
     This is an efficient calculation of the area under the ROC curve directly from an array of positives
@@ -323,22 +327,22 @@ def auc_from_bincounts(
     Examples:
         >>> auc_from_bincounts([3,1,0], [2,0,1])
     """
-    pos = np.asarray(pos)
-    neg = np.asarray(neg)
+    pos_arr = np.asarray(pos, dtype=np.uint32)
+    neg_arr = np.asarray(neg, dtype=np.uint32)
     if probs is None:
-        probs = pos / (pos + neg)
+        probs = np.asarray(pos_arr / (pos_arr + neg_arr), dtype=np.float32)
 
     binorder = np.argsort(probs)[::-1]
-    FPR = np.cumsum(neg[binorder]) / np.sum(neg)
-    TPR = np.cumsum(pos[binorder]) / np.sum(pos)
+    FPR = np.cumsum(neg_arr[binorder]) / np.sum(neg_arr)
+    TPR = np.cumsum(pos_arr[binorder]) / np.sum(pos_arr)
 
-    Area = (np.diff(FPR, prepend=0)) * (TPR + np.insert(np.roll(TPR, 1)[1:], 0, 0)) / 2
-    return safe_range_auc(np.sum(Area))
+    area = (np.diff(FPR, prepend=0)) * (TPR + np.insert(np.roll(TPR, 1)[1:], 0, 0)) / 2
+    return safe_range_auc(np.sum(area))
 
 
 def aucpr_from_probs(
     groundtruth: List[int], probs: List[float]
-) -> List[float]:  # pragma: no cover
+) -> float:  # pragma: no cover
     """Calculates PR AUC (precision-recall) from an array of truth values and predictions.
     Calculates the area under the PR curve from an array of truth values and
     predictions. Returns 0.0 when there is just one groundtruth label.
@@ -351,7 +355,7 @@ def aucpr_from_probs(
     probs : List[float]
         The predictions, as a numeric vector of the same length as groundtruth
 
-    Returns : List[float]
+    Returns : float
         The AUC as a value between 0.5 and 1.
 
     Examples:
@@ -359,7 +363,7 @@ def aucpr_from_probs(
     """
     nlabels = len(np.unique(groundtruth))
     if nlabels < 2:
-        return 0.0
+        return 0.0  # Again, is this right? Shouldn't we return a list here?
     if nlabels > 2:
         raise Exception("'Groundtruth' has more than two levels.")
 
@@ -377,7 +381,7 @@ def aucpr_from_probs(
 
 
 def aucpr_from_bincounts(
-    pos: List[int], neg: List[int], probs: List[float] = None
+    pos: Iterable[int], neg: Iterable[int], probs: Optional[Iterable[float]] = None
 ) -> float:
     """Calculates PR AUC (precision-recall) from counts of positives and negatives directly.
     This is an efficient calculation of the area under the PR curve directly from an
@@ -401,21 +405,21 @@ def aucpr_from_bincounts(
     Examples:
         >>> aucpr_from_bincounts([3,1,0], [2,0,1])
     """
-    pos = np.asarray(pos)
-    neg = np.asarray(neg)
+    pos_arr = np.asarray(pos, dtype=np.uint32)
+    neg_arr = np.asarray(neg, dtype=np.uint32)
     if probs is None:
-        o = np.argsort(-(pos / (pos + neg)))
+        o = np.argsort(-(pos_arr / (pos_arr + neg_arr)))
     else:
         o = np.argsort(-np.asarray(probs))
-    recall = np.cumsum(pos[o]) / np.sum(pos)
-    precision = np.cumsum(pos[o]) / np.cumsum(pos[o] + neg[o])
+    recall = np.cumsum(pos_arr[o]) / np.sum(pos_arr)
+    precision = np.cumsum(pos_arr[o]) / np.cumsum(pos_arr[o] + neg_arr[o])
     prevrecall = np.insert(recall[0 : (len(recall) - 1)], 0, 0)
     prevprecision = np.insert(precision[0 : (len(precision) - 1)], 0, 0)
-    Area = (recall - prevrecall) * (precision + prevprecision) / 2
-    return np.sum(Area[1:])
+    area = (recall - prevrecall) * (precision + prevprecision) / 2
+    return np.sum(area[1:])
 
 
-def auc2GINI(auc: float) -> float:
+def auc_to_gini(auc: float) -> float:
     """
     Convert AUC performance metric to GINI
 
@@ -430,12 +434,12 @@ def auc2GINI(auc: float) -> float:
         GINI metric, a number between 0 and 1
 
     Examples:
-        >>> auc2GINI(0.8232)
+        >>> auc_to_gini(0.8232)
     """
     return 2 * safe_range_auc(auc) - 1
 
 
-def _capitalize(fields: list) -> list:
+def _capitalize(fields: Iterable[str]) -> List[str]:
     """Applies automatic capitalization, aligned with the R couterpart.
 
     Parameters
@@ -448,7 +452,7 @@ def _capitalize(fields: list) -> list:
     fields : list
         The input list, but each value properly capitalized
     """
-    capitalizeEndWords = [
+    capitalize_endwords = [
         "ID",
         "Key",
         "Name",
@@ -495,13 +499,13 @@ def _capitalize(fields: list) -> list:
     fields = list(
         map(lambda x: x.replace("configurationname", "configuration"), fields)
     )
-    for word in capitalizeEndWords:
+    for word in capitalize_endwords:
         fields = [re.sub(word, word, field, flags=re.I) for field in fields]
         fields = [field[:1].upper() + field[1:] for field in fields]
     return fields
 
 
-def _polarsCapitalize(df: pl.LazyFrame):
+def _polars_capitalize(df: frame) -> frame:
     return df.rename(
         dict(
             zip(
@@ -512,7 +516,19 @@ def _polarsCapitalize(df: pl.LazyFrame):
     )
 
 
-def fromPRPCDateTime(
+@overload
+def from_prpc_datetime(
+    x: str, return_string: Literal[False] = False
+) -> datetime.datetime:
+    ...
+
+
+@overload
+def from_prpc_datetime(x: str, return_string: Literal[True]) -> str:
+    ...
+
+
+def from_prpc_datetime(
     x: str, return_string: bool = False
 ) -> Union[datetime.datetime, str]:
     """Convert from a Pega date-time string.
@@ -566,7 +582,7 @@ def fromPRPCDateTime(
         return dt
 
 
-def toPRPCDateTime(dt: datetime.datetime) -> str:
+def to_prpc_datetime(dt: datetime.datetime) -> str:
     """Convert to a Pega date-time string
 
     Parameters
@@ -605,8 +621,8 @@ def weighted_performance_polars() -> pl.Expr:
     return weighted_average_polars("Performance", "ResponseCount")
 
 
-def zRatio(
-    posCol: pl.Expr = pl.col("BinPositives"), negCol: pl.Expr = pl.col("BinNegatives")
+def z_ratio(
+    pos_col: pl.Expr = pl.col("BinPositives"), neg_col: pl.Expr = pl.col("BinNegatives")
 ) -> pl.Expr:
     """Calculates the Z-Ratio for predictor bins.
 
@@ -620,38 +636,38 @@ def zRatio(
 
     Parameters
     ----------
-    posCol: pl.Expr
+    pos_col: pl.Expr
         The (Polars) column of the bin positives
-    negCol: pl.Expr
+    neg_col: pl.Expr
         The (Polars) column of the bin positives
 
     Examples
     --------
-    >>> df.group_by(['ModelID', 'PredictorName']).agg([zRatio()]).explode()
+    >>> df.group_by(['ModelID', 'PredictorName']).agg([z_ratio()]).explode()
     """
 
-    def getFracs(posCol=pl.col("BinPositives"), negCol=pl.col("BinNegatives")):
-        return posCol / posCol.sum(), negCol / negCol.sum()
+    def get_fracs(pos_col=pl.col("BinPositives"), neg_col=pl.col("BinNegatives")):
+        return pos_col / pos_col.sum(), neg_col / neg_col.sum()
 
-    def zRatioimpl(
-        posFractionCol=pl.col("posFraction"),
-        negFractionCol=pl.col("negFraction"),
-        PositivesCol=pl.sum("BinPositives"),
-        NegativesCol=pl.sum("BinNegatives"),
+    def z_ratio_impl(
+        pos_fraction_col=pl.col("posFraction"),
+        neg_fraction_col=pl.col("negFraction"),
+        positives_col=pl.sum("BinPositives"),
+        negatives_col=pl.sum("BinNegatives"),
     ):
         return (
-            (posFractionCol - negFractionCol)
+            (pos_fraction_col - neg_fraction_col)
             / (
-                (posFractionCol * (1 - posFractionCol) / PositivesCol)
-                + (negFractionCol * (1 - negFractionCol) / NegativesCol)
+                (pos_fraction_col * (1 - pos_fraction_col) / positives_col)
+                + (neg_fraction_col * (1 - neg_fraction_col) / negatives_col)
             ).sqrt()
         ).alias("ZRatio")
 
-    return zRatioimpl(*getFracs(posCol, negCol), posCol.sum(), negCol.sum())
+    return z_ratio_impl(*get_fracs(pos_col, neg_col), pos_col.sum(), neg_col.sum())
 
 
 def lift(
-    posCol: pl.Expr = pl.col("BinPositives"), negCol: pl.Expr = pl.col("BinNegatives")
+    pos_col: pl.Expr = pl.col("BinPositives"), neg_col: pl.Expr = pl.col("BinNegatives")
 ) -> pl.Expr:
     """Calculates the Lift for predictor bins.
 
@@ -671,26 +687,26 @@ def lift(
     >>> df.group_by(['ModelID', 'PredictorName']).agg([lift()]).explode()
     """
 
-    def liftImpl(binPos, binNeg, totalPos, totalNeg):
+    def lift_impl(bin_pos, bin_neg, total_pos, total_neg):
         return (
             # TODO not sure how polars (mis)behaves when there are no positives at all
             # I would hope for a NaN but base python doesn't do that. Polars perhaps.
             # Stijn: It does have proper None value support, may work like you say
-            binPos * (totalPos + totalNeg) / ((binPos + binNeg) * totalPos)
+            bin_pos * (total_pos + total_neg) / ((bin_pos + bin_neg) * total_pos)
         ).alias("Lift")
 
-    return liftImpl(posCol, negCol, posCol.sum(), negCol.sum())
+    return lift_impl(pos_col, neg_col, pos_col.sum(), neg_col.sum())
 
 
-def LogOdds(
-    Positives=pl.col("Positives"),
-    Negatives=pl.col("ResponseCount") - pl.col("Positives"),
-):
-    N = Positives.count()
+def log_odds(
+    positives=pl.col("Positives"),
+    negatives=pl.col("ResponseCount") - pl.col("Positives"),
+) -> pl.Expr:
+    N = positives.count()
     return (
         (
-            ((Positives + 1 / N).log() - (Positives + 1).sum().log())
-            - ((Negatives + 1 / N).log() - (Negatives + 1).sum().log())
+            ((positives + 1 / N).log() - (positives + 1).sum().log())
+            - ((negatives + 1 / N).log() - (negatives + 1).sum().log())
         )
         .round(2)
         .alias("LogOdds")
@@ -699,19 +715,24 @@ def LogOdds(
 
 # TODO: reconsider this. Feature importance now stored in datamart
 # perhaps we should not bother to calculate it ourselves.
-def featureImportance(over=["PredictorName", "ModelID"]):
-    varImp = weighted_average_polars(
-        LogOdds(
+def feature_importance(over: List[str] = ["PredictorName", "ModelID"]) -> pl.Expr:
+    var_imp = weighted_average_polars(
+        log_odds(
             pl.col("BinPositives"), pl.col("BinResponseCount") - pl.col("BinPositives")
         ),
         "BinResponseCount",
     ).alias("FeatureImportance")
     if over is not None:
-        varImp = varImp.over(over)
-    return varImp
+        var_imp = var_imp.over(over)
+    return var_imp
 
 
-def gains_table(df, value: str, index=None, by=None):
+def gains_table(
+    df: frame,
+    value: str,
+    index: Optional[str] = None,
+    by: Optional[Union[List[str], str]] = None,
+) -> pl.DataFrame:
     """Calculates cumulative gains from any data frame.
 
     The cumulative gains are the cumulative values expressed
@@ -742,8 +763,8 @@ def gains_table(df, value: str, index=None, by=None):
     >>> gains_data = gains_table(df, 'ResponseCount', by=['Channel','Direction])
     """
 
-    sortExpr = pl.col(value) if index is None else pl.col(value) / pl.col(index)
-    indexExpr = (
+    sort_expr = pl.col(value) if index is None else pl.col(value) / pl.col(index)
+    index_expr = (
         (pl.int_range(1, pl.count() + 1) / pl.count())
         if index is None
         else (pl.cum_sum(index) / pl.sum(index))
@@ -754,23 +775,23 @@ def gains_table(df, value: str, index=None, by=None):
             [
                 pl.DataFrame(data={"cum_x": [0.0], "cum_y": [0.0]}).lazy(),
                 df.lazy()
-                .sort(sortExpr, descending=True)
+                .sort(sort_expr, descending=True)
                 .select(
-                    indexExpr.cast(pl.Float64).alias("cum_x"),
+                    index_expr.cast(pl.Float64).alias("cum_x"),
                     (pl.cum_sum(value) / pl.sum(value)).cast(pl.Float64).alias("cum_y"),
                 ),
             ]
         )
     else:
         by_as_list = by if isinstance(by, list) else [by]
-        sortExpr = by_as_list + [sortExpr]
+        sort_expr = by_as_list + [sort_expr]
         gains_df = (
             df.lazy()
-            .sort(sortExpr, descending=True)
+            .sort(sort_expr, descending=True)
             .select(
                 by_as_list
                 + [
-                    indexExpr.over(by).cast(pl.Float64).alias("cum_x"),
+                    index_expr.over(by).cast(pl.Float64).alias("cum_x"),
                     (pl.cum_sum(value) / pl.sum(value))
                     .over(by)
                     .cast(pl.Float64)
@@ -787,7 +808,7 @@ def gains_table(df, value: str, index=None, by=None):
 
 
 # TODO: perhaps the color / plot utils should move into a separate file
-def legend_color_order(fig):
+def legend_color_order(fig: go.Figure) -> go.Figure:
     """Orders legend colors alphabetically in order to provide pega color
     consistency among different categories"""
 
@@ -827,48 +848,3 @@ def legend_color_order(fig):
                 pass
 
     return fig
-
-
-def sync_reports(checkOnly: bool = False, autoUpdate: bool = False):
-    """Compares the report files in your local directory to the repo
-
-    If any of the files are different from the ones in GitHub,
-    will prompt you to update them.
-
-    Parameters
-    ----------
-    checkOnly : bool, default = False
-        If True, only checks, does not prompt to update
-    autoUpdate : bool, default = False
-        If True, doensn't prompt for update and goes ahead
-    """
-    from pdstools import __reports__
-    import glob
-    import urllib
-
-    files = [f for f in glob.glob(str(__reports__ / "*.qmd"))]
-    latest = {}
-    replacement = {}
-    for file in files:
-        name = file.rsplit("/")[-1]
-        path = f"http://raw.githubusercontent.com/pegasystems/pega-datascientist-tools/master/python/pdstools/reports/{name}"
-        fileFromUrl = urllib.request.urlopen(path).read()
-        latest[file] = (
-            int.from_bytes(fileFromUrl) ^ int.from_bytes(open(file).read().encode())
-            == 0
-        )
-        if not latest[file]:
-            replacement[file] = fileFromUrl
-    if False in latest.values():
-        if not checkOnly and (
-            autoUpdate
-            or input("One or more files out of sync. Enter 'y' to update them:")
-        ):
-            for filename, file in replacement.items():
-                with open(filename, "w") as f:
-                    f.write(file.decode())
-            return True
-        else:
-            return False
-    else:
-        return True

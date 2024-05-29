@@ -5,24 +5,31 @@ import re
 import urllib
 import zipfile
 from io import BytesIO
-from typing import Literal, Union
+from pathlib import Path
+from typing import Any, List, Literal, TypeVar, Union, overload
+
+PathLike = Union[str, bytes, os.PathLike]
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import pytz
 import requests
+from polars.interchange.protocol import SupportsInterchange
+from polars.type_aliases import IpcCompression, ParquetCompression
 from tqdm import tqdm
 
-from ..utils.cdh_utils import fromPRPCDateTime
+from ..utils.cdh_utils import from_prpc_datetime
 
 
-def readDSExport(
-    filename: Union[pd.DataFrame, pl.DataFrame, str],
-    path: str = ".",
+def read_ds_export(
+    filename: Union[
+        str, SupportsInterchange, Literal["model_data", "predictor_data"], BytesIO
+    ],
+    path: PathLike = ".",
     verbose: bool = True,
     **reading_opts,
-) -> pl.LazyFrame:
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """Read a Pega dataset export file.
     Can accept either a Pandas DataFrame or one of the following formats:
     - .csv
@@ -33,7 +40,7 @@ def readDSExport(
     - .parquet
 
     It automatically infers the default file names for both model data as well as predictor data.
-    If you supply either 'modelData' or 'predictorData' as the 'file' argument, it will search for them.
+    If you supply either 'model_data' or 'predictor_data' as the 'file' argument, it will search for them.
     If you supply the full name of the file in the 'path' directory, it will import that instead.
     Since pdstools V3.x, returns a Polars LazyFrame. Simply call `.collect()` to get an eager frame.
 
@@ -43,8 +50,8 @@ def readDSExport(
         Either a Pandas/Polars DataFrame with the source data (for compatibility),
         or a string, in which case it can either be:
         - The name of the file (if a custom name) or
-        - Whether we want to look for 'modelData' or 'predictorData' in the path folder.
-    path : str, default = '.'
+        - Whether we want to look for 'model_data' or 'predictor_data' in the path folder.
+    path : PathLike, default = '.'
         The location of the file
     verbose : bool, default = True
         Whether to print out which file will be imported
@@ -69,34 +76,29 @@ def readDSExport(
     """
 
     # If a lazy frame is supplied directly, we just pass it through
-    if isinstance(filename, pl.LazyFrame):
-        logging.debug("Lazyframe returned directly")
+    if isinstance(filename, (pl.LazyFrame, pl.DataFrame)):
+        logging.debug("Polars frame returned directly")
         return filename
 
-    # If a dataframe is supplied directly, we can just return its lazy version
-    if isinstance(filename, pl.DataFrame):
-        logging.debug("Dataframe returned directly")
-        return filename.lazy()
-
-    # If dataframe is pandas, we transform to Polars
-    if isinstance(filename, pd.DataFrame):
-        logging.debug("Pandas dataframe supplied, transforming to polars")
-        return pl.DataFrame(filename).lazy()
+    # Through the DataFrame protocol, we can accept any DataFrame-like objects
+    if filename and not isinstance(filename, (str, BytesIO, Path)):
+        if hasattr(filename, "__dataframe__"):  # it implements the dataframe protocol
+            return pl.from_dataframe(filename)
 
     # If the data is a BytesIO object, such as an uploaded file
     # in certain webapps, then we can simply return the object
     # as is, while extracting the extension as well.
     if isinstance(filename, BytesIO):
         logging.debug("Filename is of type BytesIO, importing that directly")
-        name, extension = os.path.splitext(filename.name)
+        _, extension = os.path.splitext(filename.name)
         return import_file(filename, extension, **reading_opts)
 
     # If the filename is simply a string, then we first
     # extract the extension of the file, then look for
     # the file in the user's directory.
-    if os.path.isfile(os.path.join(path, filename)):
+    if os.path.isfile(os.path.join(str(path), str(filename))):
         logging.debug("File found in directory")
-        file = os.path.join(path, filename)
+        file = os.path.join(str(path), str(filename))
     else:
         logging.debug("File not found in directory, scanning for latest file")
         file = get_latest_file(path, filename)
@@ -132,7 +134,9 @@ def readDSExport(
     return import_file(file, extension, **reading_opts)
 
 
-def import_file(file: str, extension: str, **reading_opts) -> pl.LazyFrame:
+def import_file(
+    file: Union[PathLike, BytesIO], extension: str, **reading_opts
+) -> Union[pl.DataFrame, pl.LazyFrame]:
     """Imports a file using Polars
 
     Parameters
@@ -144,12 +148,16 @@ def import_file(file: str, extension: str, **reading_opts) -> pl.LazyFrame:
 
     Returns
     -------
-    pl.LazyFrame
-        The (imported) lazy dataframe
+    pl.LazyFrame or pl.DataFrame
+        The (imported) DataFrame. If we can scan the file, we return a LazyFrame.
+        Sometimes we can't scan the file (like for remote files or zips), in which case
+        we return a DataFrame. This is useful for inferring if the data actually resides
+        in memory or whether the data has not been read yet.
     """
+
     if extension == ".zip":
         logging.debug("Zip file found, extracting data.json to BytesIO.")
-        file, extension = readZippedFile(file)
+        file, extension = read_zipped_file(file)
     elif extension == ".gz":
         import gzip
 
@@ -166,53 +174,52 @@ def import_file(file: str, extension: str, **reading_opts) -> pl.LazyFrame:
             ignore_errors=reading_opts.get("ignore_errors", False),
         )
         if isinstance(file, BytesIO):
-            file = pl.read_csv(
+            return pl.read_csv(
                 file,
                 **csv_opts,
-            ).lazy()
+            )
         else:
-            file = pl.scan_csv(file, **csv_opts)
+            return pl.scan_csv(file, **csv_opts)
 
     elif extension == ".json":
         try:
             if isinstance(file, BytesIO):
                 from pyarrow import json
 
-                file = pl.LazyFrame(
+                file = pl.DataFrame(
                     json.read_json(
                         file,
                     )
                 )
             else:
-                file = pl.scan_ndjson(
+                return pl.scan_ndjson(
                     file,
                     infer_schema_length=reading_opts.pop("infer_schema_length", 10000),
                 )
         except:  # pragma: no cover
             try:
-                file = pl.read_json(file).lazy()
+                return pl.read_json(file)
             except:
                 import json
 
                 with open(file) as f:
-                    file = pl.from_dicts(json.loads(f.read())["pxResults"]).lazy()
+                    return pl.from_dicts(json.loads(f.read())["pxResults"])
 
     elif extension == ".parquet":
-        file = pl.scan_parquet(file)
+        return pl.scan_parquet(file)
 
     elif extension.casefold() in {".feather", ".ipc", ".arrow"}:
         if isinstance(file, BytesIO):
-            file = pl.read_ipc(file).lazy()
+            return pl.read_ipc(file)
         else:
-            file = pl.scan_ipc(file)
+            return pl.scan_ipc(file)
 
     else:
         raise ValueError(f"Could not import file: {file}, with extension {extension}")
+    return pl.LazyFrame()
 
-    return file
 
-
-def readZippedFile(file: str, verbose: bool = False) -> BytesIO:
+def read_zipped_file(file: PathLike, verbose: bool = False) -> BytesIO:
     """Read a zipped NDJSON file.
     Reads a dataset export file as exported and downloaded from Pega. The export
     file is formatted as a zipped multi-line JSON file. It reads the file,
@@ -220,7 +227,7 @@ def readZippedFile(file: str, verbose: bool = False) -> BytesIO:
 
     Parameters
     ----------
-    file : str
+    file : PathLike
         The full path to the file
     verbose : str, default=False
         Whether to print the names of the files within the unzipped file for debugging purposes
@@ -231,7 +238,7 @@ def readZippedFile(file: str, verbose: bool = False) -> BytesIO:
         The raw bytes object to pass through to Polars
     """
 
-    def getValidFiles(files):
+    def _get_valid_files(files):
         logging.debug(f"Files found: {files}")
         if "data.json" in files:
             return "data.json"
@@ -244,7 +251,7 @@ def readZippedFile(file: str, verbose: bool = False) -> BytesIO:
 
     with zipfile.ZipFile(file, mode="r") as z:
         logging.debug("Opened zip file.")
-        file = getValidFiles(z.namelist())
+        file = _get_valid_files(z.namelist())
         logging.debug(f"Opening file {file}")
         if file is not None:
             logging.debug("data.json found.")
@@ -262,7 +269,9 @@ def readZippedFile(file: str, verbose: bool = False) -> BytesIO:
             raise FileNotFoundError("Cannot find a 'data.json' file in the zip folder.")
 
 
-def readMultiZip(files: list, zip_type: Literal["gzip"] = "gzip", verbose: bool = True):
+def read_multi_zip(
+    files: List[PathLike], zip_type: Literal["gzip"] = "gzip", verbose: bool = True
+) -> pl.DataFrame:
     """Reads multiple zipped ndjson files, and concats them to one Polars dataframe.
 
     Parameters
@@ -287,20 +296,24 @@ def readMultiZip(files: list, zip_type: Literal["gzip"] = "gzip", verbose: bool 
     return df
 
 
-def get_latest_file(path: str, target: str, verbose: bool = False) -> str:
+def get_latest_file(
+    path: PathLike,
+    target: Literal["model_data", "predictor_data", "value_finder"],
+    verbose: bool = False,
+) -> Union[str, None]:
     """Convenience method to find the latest model snapshot.
     It has a set of default names to search for and finds all files who match it.
     Once it finds all matching files in the directory, it chooses the most recent one.
     Supports [".json", ".csv", ".zip", ".parquet", ".feather", ".ipc"].
-    Needs a path to the directory and a target of either 'modelData' or 'predictorData'.
+    Needs a path to the directory and a target of either 'model_data' or 'predictor_data'.
 
     Parameters
     ----------
-    path : str
+    path : PathLike
         The filepath where the data is stored
-    target : str in ['modelData', 'predictorData']
-        Whether to look for data about the predictive models ('modelData')
-        or the predictor bins ('predictorData')
+    target : str in ['model_data', 'predictor_d`ata', 'value_finder']
+        Whether to look for data about the predictive models ('model_Data')
+        or the predictor bins ('predictor_data')
     verbose : bool, default = False
         Whether to print all found files before comparing name criteria for debugging purposes
 
@@ -309,8 +322,8 @@ def get_latest_file(path: str, target: str, verbose: bool = False) -> str:
     str
         The most recent file given the file name criteria.
     """
-    if target not in {"modelData", "predictorData", "ValueFinder"}:
-        return f"Target not found"
+    if target not in {"model_data", "predictor_data", "value_finder"}:
+        return "Target not found"
 
     supported = [".json", ".csv", ".zip", ".parquet", ".feather", ".ipc", ".arrow"]
 
@@ -318,7 +331,7 @@ def get_latest_file(path: str, target: str, verbose: bool = False) -> str:
     files_dir = [f for f in files_dir if os.path.splitext(f)[-1].lower() in supported]
     if verbose:
         print(files_dir)  # pragma: no cover
-    matches = getMatches(files_dir, target)
+    matches = get_matches(files_dir, target)
 
     if len(matches) == 0:  # pragma: no cover
         if verbose:
@@ -331,8 +344,8 @@ def get_latest_file(path: str, target: str, verbose: bool = False) -> str:
 
     def f(x):
         try:
-            return fromPRPCDateTime(re.search("\d.*GMT", x)[0].replace("_", " "))
-        except:
+            return from_prpc_datetime(re.search("\d.*GMT", x)[0].replace("_", " "))
+        except Exception:
             return pytz.timezone("GMT").localize(
                 datetime.datetime.fromtimestamp(os.path.getctime(x))
             )
@@ -341,7 +354,7 @@ def get_latest_file(path: str, target: str, verbose: bool = False) -> str:
     return paths[np.argmax(dates)]
 
 
-def getMatches(files_dir, target):
+def get_matches(files_dir, target):
     matches = []
     default_model_names = [
         "Data-Decision-ADM-ModelSnapshot",
@@ -349,7 +362,7 @@ def getMatches(files_dir, target):
         "model_snapshots",
         "MD_FACT",
         "ADMMART_MDL_FACT_Data",
-        "cached_modelData",
+        "cached_model_data",
         "Models_data",
     ]
     default_predictor_names = [
@@ -357,16 +370,16 @@ def getMatches(files_dir, target):
         "PR_DATA_DM_ADMMART_PRED",
         "predictor_binning_snapshots",
         "PRED_FACT",
-        "cached_predictorData",
+        "cached_predictor_data",
     ]
-    ValueFinder_names = ["Data-Insights_pyValueFinder", "cached_ValueFinder"]
+    value_finder_names = ["Data-Insights_pyValueFinder", "cached_ValueFinder"]
 
-    if target == "modelData":
+    if target == "model_data":
         names = default_model_names
-    elif target == "predictorData":
+    elif target == "predictor_data":
         names = default_predictor_names
     elif target == "ValueFinder":
-        names = ValueFinder_names
+        names = value_finder_names
     else:
         raise ValueError(f"Target {target} not found.")
     for file in files_dir:
@@ -376,13 +389,35 @@ def getMatches(files_dir, target):
     return matches
 
 
+@overload
 def cache_to_file(
     df: Union[pl.DataFrame, pl.LazyFrame],
-    path: os.PathLike,
+    path: PathLike,
+    name: str,
+    cache_type: Literal["ipc"] = "ipc",
+    compression: IpcCompression = "uncompressed",
+) -> Path:
+    ...
+
+
+@overload
+def cache_to_file(
+    df: Union[pl.DataFrame, pl.LazyFrame],
+    path: PathLike,
+    name: str,
+    cache_type: Literal["parquet"] = "parquet",
+    compression: ParquetCompression = "uncompressed",
+) -> Path:
+    ...
+
+
+def cache_to_file(
+    df: Union[pl.DataFrame, pl.LazyFrame],
+    path: PathLike,
     name: str,
     cache_type: Literal["ipc", "parquet"] = "ipc",
-    compression: str = "uncompressed",
-) -> str:
+    compression: Union[ParquetCompression, IpcCompression] = "uncompressed",
+) -> Path:
     """Very simple convenience function to cache data.
     Caches in arrow format for very fast reading.
 
@@ -411,9 +446,9 @@ def cache_to_file(
     if isinstance(df, pl.LazyFrame):
         df = df.collect()
     if cache_type == "ipc":
-        outpath = f"{outpath}.arrow"
+        outpath = outpath.joinpath(".arrow")
         df.write_ipc(outpath, compression=compression)
     if cache_type == "parquet":
-        outpath = f"{outpath}.parquet"
+        outpath = outpath.joinpath(".parquet")
         df.write_parquet(outpath, compression=compression)
     return outpath
